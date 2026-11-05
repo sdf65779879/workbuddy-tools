@@ -1178,4 +1178,84 @@ mod channel_protocol_tests {
             }
         }
     }
+
+    #[tokio::test]
+    async fn content_blocked_retries_once_with_degraded_prompt_then_succeeds() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen: ChannelRequests = Arc::new(Mutex::new(Vec::new()));
+        let hits2 = hits.clone();
+        let seen2 = seen.clone();
+        let app = Router::new().route(
+            "/v2/chat/completions",
+            post(move |body: Bytes| {
+                let hits = hits2.clone();
+                let seen = seen2.clone();
+                async move {
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    let n = hits.fetch_add(1, Ordering::SeqCst);
+                    seen.lock().unwrap().push((HeaderMap::new(), body.clone()));
+                    if n == 0 {
+                        // 首次：返回 11128 内容审核误报（unapproved channel）。
+                        return Response::builder()
+                            .status(StatusCode::BAD_REQUEST)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(
+                                r#"{"code":11128,"msg":"Illegal API invocation from an unapproved channel"}"#,
+                            ))
+                            .unwrap();
+                    }
+                    Response::builder()
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from(concat!(
+                            "data: {\"id\":\"degraded-test\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"degraded ok\"}}]}\n\n",
+                            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
+                            "data: [DONE]\n\n"
+                        )))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let ctx = channel_context(format!("http://{address}"), "cn", false).await;
+        let payload = serde_json::json!({
+            "model": "workbuddy-fast",
+            "stream": true,
+            "messages": [
+                {"role": "system", "content": "You are Claude Code, Anthropic's official CLI for Claude"},
+                {"role": "user", "content": "你是谁"}
+            ]
+        });
+        let response = build_router(ctx)
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let wire =
+            String::from_utf8(to_bytes(response.into_body(), usize::MAX).await.unwrap().to_vec())
+                .unwrap();
+        assert!(wire.contains("degraded ok"));
+        server.abort();
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        let seen = seen.lock().unwrap();
+        // 第一次：原始 system 已被出站 sanitize 改写（仍非中性提示词）。
+        assert_eq!(seen[0].1["messages"][0]["role"], "system");
+        assert!(seen[0].1["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("official CLI tool"));
+        // 第二次：降级重试，system 替换为中性提示词。
+        assert_eq!(seen[1].1["messages"][0]["role"], "system");
+        assert_eq!(
+            seen[1].1["messages"][0]["content"],
+            crate::gateway::translate::DEGRADED_SYSTEM_PROMPT
+        );
+    }
 }

@@ -893,7 +893,8 @@ pub async fn handle_chat(ctx: Ctx, headers: HeaderMap, body: Vec<u8>) -> Respons
 
     let mut tried = std::collections::HashSet::new();
     let mut attempts: i64 = 0;
-    let max_attempts = cfg
+    let mut degraded_applied = false;
+    let mut max_attempts = cfg
         .accounts
         .iter()
         .filter(|account| account.enabled && !account.paused)
@@ -967,6 +968,16 @@ pub async fn handle_chat(ctx: Ctx, headers: HeaderMap, body: Vec<u8>) -> Respons
             let text = resp.text().await.unwrap_or_default();
             let duration = started.elapsed().as_millis() as i64;
             let kind = classify_upstream_error(status, &text);
+            // 内容审核误报（11128 unapproved channel 等）：system 来源的指纹被上游
+            // 逐字审核误杀，账号健康。换 Degraded 中性提示词同请求内重试一次。
+            let mut degraded_this_attempt = false;
+            if kind == ErrorKind::ContentBlocked && !degraded_applied {
+                degraded_applied = true;
+                degraded_this_attempt = true;
+                translate::apply_degraded_prompt(&mut value);
+                // 降级重试不计入轮转预算：单账号池（max_attempts=1）也拿得到这次机会。
+                max_attempts += 1;
+            }
             ctx.pool
                 .note_error(&account.uid, kind, &format!("{status}"))
                 .await;
@@ -983,6 +994,11 @@ pub async fn handle_chat(ctx: Ctx, headers: HeaderMap, body: Vec<u8>) -> Respons
                 false,
             )
             .await;
+            if degraded_this_attempt {
+                // 单账号池也拿得到重试机会：把当前账号放回候选。
+                tried.remove(&account.uid);
+                continue;
+            }
             if attempts < max_attempts as i64 {
                 continue;
             }

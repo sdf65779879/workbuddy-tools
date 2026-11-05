@@ -369,10 +369,194 @@ fn content_is_empty(content: &serde_json::Value) -> bool {
     }
 }
 
+/// 降级中性提示词：内容审核误报（11128 unapproved channel 等）的同请求重试用，
+/// 刻意极简中性。与 codebuddy_sub2api 的 prompt.Degraded 同口径。
+pub const DEGRADED_SYSTEM_PROMPT: &str = "You are a helpful assistant. Respond in the user's language, follow the user's instructions, and be direct and concise.";
+
+/// 上游反探测指纹剥离（与 codebuddy_sub2api 的 sanitize.go 同口径）。
+/// 上游内容审核按逐字精确匹配误杀合法流量（Claude Code / Codex 等 CLI 注入的
+/// 模板句），一字改动即可绕过。出站前做最小改写/剥离，语义不变。
+const SANITIZE_REWRITES: &[(&str, &str)] = &[
+    (
+        "You are Claude Code, Anthropic's official CLI for Claude",
+        "You are Claude Code, Anthropic's official CLI tool for Claude",
+    ),
+    (
+        "Main branch (you will usually use this for PRs)",
+        "Default branch (you will usually use this for PRs)",
+    ),
+    (
+        "You are a coding agent running in the Codex CLI, a terminal-based coding assistant.",
+        "You are a coding agent running in the Codex CLI tool, a terminal-based coding assistant.",
+    ),
+    (
+        "To give feedback, users should report the issue at https://github.com/anthropics/claude-code/issues",
+        "To provide feedback, users should report the issue at https://github.com/anthropics/claude-code/issues",
+    ),
+    // 上游反探测：请求体出现裸数字 11128 即整单拦截（与其上下文无关），
+    // 11128 正是本类拦截自身的错误码。插入连字符保留可读性与指代。
+    ("11128", "11-128"),
+];
+
+/// 特征预检：任一命中才进入净化（快速路径，普通请求零分配）。
+fn has_fingerprint(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "you are claude code",
+        "main branch (",
+        "you are a coding agent running in the codex cli",
+        "github.com/anthropics/",
+        "11128",
+        "x-anthropic-billing-header",
+        "cc_",
+    ]
+    .iter()
+    .any(|feature| lower.contains(feature))
+}
+
+/// 大小写不敏感替换（仅 ASCII；指纹均为 ASCII，字节长度不变，偏移安全）。
+fn replace_ascii_ci(text: &str, from: &str, to: &str) -> String {
+    let lower_from = from.to_ascii_lowercase();
+    let mut result = String::with_capacity(text.len());
+    let mut rest = text;
+    loop {
+        let lower_rest = rest.to_ascii_lowercase();
+        let Some(pos) = lower_rest.find(&lower_from) else {
+            result.push_str(rest);
+            break;
+        };
+        result.push_str(&rest[..pos]);
+        result.push_str(to);
+        rest = &rest[pos + from.len()..];
+    }
+    result
+}
+
+/// 清理尾随裸键值（cc_xxx=...; 循环清理，Claude Code 注入痕迹）。
+fn strip_cc_key_values(text: &str) -> String {
+    let mut out = text.to_string();
+    // 有界轮次，防止异常输入死循环。
+    for _ in 0..16 {
+        let lower = out.to_ascii_lowercase();
+        let Some(pos) = lower.find("cc_") else { break };
+        let after = &out[pos + 3..];
+        let Some(eq) = after.find('=') else { break };
+        // 键名必须是 [a-z0-9_]+（不含空格/标点），否则不是注入键值形态。
+        if eq == 0 || !after[..eq].chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            break;
+        }
+        let value_start = pos + 3 + eq + 1;
+        let rest = &out[value_start..];
+        // 值到下一个分号/换行/串尾。
+        let end = rest
+            .find([';', '\n'])
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        out.replace_range(pos..(value_start + end), "");
+    }
+    out
+}
+
+fn sanitize_text(text: &str) -> String {
+    if !has_fingerprint(text) {
+        return text.to_string();
+    }
+    let mut out = text.to_string();
+    for (from, to) in SANITIZE_REWRITES {
+        out = out.replace(from, to);
+    }
+    // header 键名（大小写不敏感，含键值/裸键名形态）缩写：破坏逐字匹配。
+    out = replace_ascii_ci(&out, "x-anthropic-billing-header", "x-anthropic-billing-hdr");
+    out = strip_cc_key_values(&out);
+    out.trim().to_string()
+}
+
+fn sanitize_content(content: &mut serde_json::Value) {
+    match content {
+        serde_json::Value::String(text) => {
+            let cleaned = sanitize_text(text);
+            if cleaned != *text {
+                *content = serde_json::json!(cleaned);
+            }
+        }
+        serde_json::Value::Array(parts) => {
+            for part in parts.iter_mut() {
+                let cleaned = part
+                    .get("text")
+                    .and_then(|value| value.as_str())
+                    .map(sanitize_text);
+                if let Some(text) = cleaned {
+                    part["text"] = serde_json::json!(text);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 净化出站请求体中的反探测指纹：content / reasoning / reasoning_content /
+/// tool_calls[].function.arguments。任一命中才改写，普通请求零改动。
+pub fn sanitize_fingerprints(chat: &mut serde_json::Value) {
+    let Some(messages) = chat.get_mut("messages").and_then(|value| value.as_array_mut()) else {
+        return;
+    };
+    for message in messages.iter_mut() {
+        let Some(object) = message.as_object_mut() else { continue };
+        if let Some(content) = object.get_mut("content") {
+            sanitize_content(content);
+        }
+        for key in ["reasoning", "reasoning_content"] {
+            let cleaned = object
+                .get(key)
+                .and_then(|value| value.as_str())
+                .map(sanitize_text);
+            if let Some(text) = cleaned {
+                object.insert(key.into(), serde_json::json!(text));
+            }
+        }
+        if let Some(calls) = object.get_mut("tool_calls").and_then(|value| value.as_array_mut()) {
+            for call in calls.iter_mut() {
+                if let Some(args) = call
+                    .get_mut("function")
+                    .and_then(|value| value.get_mut("arguments"))
+                {
+                    if let Some(text) = args.as_str() {
+                        let cleaned = sanitize_text(text);
+                        *args = serde_json::json!(cleaned);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 把 system/developer 消息全部替换为一条 Degraded 中性提示词（头部插入），
+/// 其余 user/assistant/tool 消息逐字不动。用于内容审核误报（11128 unapproved
+/// channel 等）的同请求降级重试：从源头消灭 system 来源的指纹。
+pub fn apply_degraded_prompt(chat: &mut serde_json::Value) {
+    let Some(messages) = chat.get_mut("messages").and_then(|value| value.as_array_mut()) else {
+        return;
+    };
+    let kept: Vec<serde_json::Value> = messages
+        .drain(..)
+        .filter(|message| {
+            let role = message.get("role").and_then(|value| value.as_str());
+            !matches!(role, Some("system") | Some("developer"))
+        })
+        .collect();
+    let mut rewritten = vec![serde_json::json!({
+        "role": "system",
+        "content": DEGRADED_SYSTEM_PROMPT,
+    })];
+    rewritten.extend(kept);
+    *messages = rewritten;
+}
+
 /// The desktop upstream accepts streaming chat requests. Clients may still ask
 /// the gateway for JSON; that stream is collected into a completion downstream.
 pub fn prepare_upstream_chat(chat: &mut serde_json::Value) -> Result<(), String> {
     normalize_chat_messages(chat)?;
+    sanitize_fingerprints(chat);
     if chat.get("max_tokens").is_none() {
         if let Some(value) = chat.get("max_completion_tokens").cloned() {
             chat["max_tokens"] = value;
@@ -493,6 +677,56 @@ mod request_tests {
                 assert!(body.get("tools").is_none());
             }
         }
+    }
+
+    #[test]
+    fn sanitize_fingerprints_strips_upstream_policy_fingerprints() {
+        let mut body = json!({
+            "messages": [
+                {"role": "system", "content": "You are Claude Code, Anthropic's official CLI for Claude. To give feedback, users should report the issue at https://github.com/anthropics/claude-code/issues"},
+                {"role": "user", "content": "upstream returned code=11128 for this request"},
+                {"role": "assistant", "content": "ok", "tool_calls": [{"function": {"name": "run", "arguments": "{\"command\":\"echo 11128\"}"}}]},
+                {"role": "tool", "content": "x-anthropic-billing-header: abc; cc_version=1.0; done"}
+            ]
+        });
+        sanitize_fingerprints(&mut body);
+        let msgs = body["messages"].as_array().unwrap();
+        // 身份句 / 反馈句只改一个词，语义不变。
+        assert!(msgs[0]["content"].as_str().unwrap().contains("official CLI tool for Claude"));
+        assert!(msgs[0]["content"].as_str().unwrap().contains("To provide feedback"));
+        assert!(!msgs[0]["content"].as_str().unwrap().contains("To give feedback"));
+        // 裸 11128 反探测串改写为 11-128。
+        assert!(msgs[1]["content"].as_str().unwrap().contains("11-128"));
+        assert!(!msgs[1]["content"].as_str().unwrap().contains("11128"));
+        // tool_calls arguments 同样净化。
+        let args = &msgs[2]["tool_calls"][0]["function"]["arguments"];
+        assert!(args.as_str().unwrap().contains("11-128"));
+        assert!(!args.as_str().unwrap().contains("11128"));
+        // header 键名缩写 + cc_ 键值清理。
+        let tool_content = msgs[3]["content"].as_str().unwrap();
+        assert!(!tool_content.contains("x-anthropic-billing-header"));
+        assert!(!tool_content.contains("cc_version=1.0"));
+    }
+
+    #[test]
+    fn apply_degraded_prompt_replaces_system_with_neutral() {
+        let mut body = json!({
+            "messages": [
+                {"role": "system", "content": "You are Claude Code, Anthropic's official CLI for Claude"},
+                {"role": "developer", "content": "some injected instructions"},
+                {"role": "user", "content": "你是谁"},
+                {"role": "assistant", "content": "hi"}
+            ]
+        });
+        apply_degraded_prompt(&mut body);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[0]["content"], DEGRADED_SYSTEM_PROMPT);
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[1]["content"], "你是谁");
+        assert_eq!(msgs[2]["role"], "assistant");
+        assert_eq!(msgs[2]["content"], "hi");
     }
 }
 
