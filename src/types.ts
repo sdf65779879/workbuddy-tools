@@ -342,6 +342,8 @@ export interface LogFilter {
 
 // ---- 任务中心 ----
 export interface TaskView {
+  skipped?: boolean;
+  skip_reason?: string | null;
   task_code: string;
   title: string;
   description: string;
@@ -360,6 +362,9 @@ export interface TaskView {
 }
 
 export interface TaskRunItem {
+  completed?: number;
+  skipped?: number;
+  waiting?: number;
   uid: string;
   nickname: string;
   checkin: string;
@@ -374,6 +379,26 @@ export interface TaskRunResult {
   items: TaskRunItem[];
   total_credit: number;
   total_energy: number;
+}
+
+export interface TaskJobSnapshot {
+  id: string;
+  status: "running" | "completed" | "partial" | "failed";
+  started_at: number;
+  finished_at: number | null;
+  total: number;
+  completed: number;
+  current_uid: string | null;
+  logs: {
+    seq: number;
+    time: number;
+    uid: string | null;
+    nickname: string | null;
+    task_code: string | null;
+    status: string;
+    message: string;
+  }[];
+  result: TaskRunResult;
 }
 
 export interface TaskScanItem {

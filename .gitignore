@@ -2,6 +2,7 @@
 node_modules
 dist
 src-tauri/target
+src-tauri/target-verify
 src-tauri/gen
 
 # 记忆库（误删无法恢复，勿提交）

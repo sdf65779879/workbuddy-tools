@@ -23,6 +23,7 @@ pub struct AppState {
     pub account_refreshes: Arc<Mutex<HashSet<String>>>,
     pub renewal: Arc<renewal::Service>,
     pub browser_auth: Arc<browser_auth::Service>,
+    pub task_jobs: Arc<crate::task_jobs::Service>,
     pub gateway: Mutex<Option<GatewayHandle>>,
     pub keys: Arc<apikey::Store>,
     pub pool: Arc<Pool>,
@@ -598,54 +599,95 @@ pub async fn reqlog_read(
 #[tauri::command]
 pub async fn task_scan_all(state: State<'_, AppState>) -> Result<Vec<TaskScanItem>, String> {
     let cfg = state.shared_cfg.read().await.clone();
-    let client = gateway::upstream::new_client()?;
-    let mut out = Vec::new();
-    for a in cfg
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| "无法创建任务查询客户端".to_string())?;
+    let accounts: Vec<_> = cfg
         .accounts
         .iter()
         .filter(|a| a.enabled && !a.paused && a.realm == "cn")
-    {
-        let res =
-            tasks::list_tasks(&client, cfg.base_url.trim_end_matches('/'), a.token.trim()).await;
-        out.push(TaskScanItem {
-            uid: a.uid.clone(),
-            nickname: a.nickname.clone(),
-            tasks: res.clone().unwrap_or_default(),
-            error: res.err(),
-        });
+        .cloned()
+        .collect();
+    Ok(futures_util::stream::iter(accounts)
+        .map(|a| {
+            let client = client.clone();
+            let base = cfg.base_url.clone();
+            async move {
+                let mut res = match tokio::time::timeout(
+                    std::time::Duration::from_secs(35),
+                    tasks::list_tasks_for_account(&client, &base, &a),
+                )
+                .await
+                {
+                    Ok(res) => res,
+                    Err(_) => Err("任务查询超时，请重试".into()),
+                };
+                if let Err(error) = &mut res {
+                    for secret in [a.token.trim(), a.refresh_token.trim()] {
+                        if !secret.is_empty() {
+                            *error = error.replace(secret, "[已隐藏凭证]");
+                        }
+                    }
+                }
+                TaskScanItem {
+                    uid: a.uid,
+                    nickname: a.nickname,
+                    tasks: res.clone().unwrap_or_default(),
+                    error: res.err(),
+                }
+            }
+        })
+        .buffered(4)
+        .collect()
+        .await)
+}
+
+#[tauri::command]
+pub async fn start_task_job(
+    state: State<'_, AppState>,
+    uid: Option<String>,
+) -> Result<crate::task_jobs::Snapshot, String> {
+    state.task_jobs.start(uid).await
+}
+
+#[tauri::command]
+pub fn task_job_status(state: State<'_, AppState>) -> Option<crate::task_jobs::Snapshot> {
+    state.task_jobs.status()
+}
+
+async fn wait_task_job(
+    service: &Arc<crate::task_jobs::Service>,
+    uid: Option<String>,
+) -> Result<TaskRunResult, String> {
+    let started = service.start(uid).await?;
+    loop {
+        let snapshot = service.status().ok_or("任务作业不存在")?;
+        if snapshot.id != started.id {
+            return Err("任务已结束，新作业已启动，请在成长任务查看结果".into());
+        }
+        if snapshot.status != "running" {
+            return Ok(snapshot.result);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
-    Ok(out)
 }
 
 #[tauri::command]
 pub async fn task_run_all(state: State<'_, AppState>) -> Result<TaskRunResult, String> {
-    let started_at_ms = reqlog::now_ms();
-    let cfg = state.shared_cfg.read().await.clone();
-    let client = gateway::upstream::new_client()?;
-    let result = tasks::run_all(&client, cfg.base_url.trim_end_matches('/'), &cfg.accounts).await;
-    for item in &result.items {
-        if matches!(item.checkin.as_str(), "ok" | "already") {
-            state.pool.set_checkin_done(&item.uid, started_at_ms);
-        }
-    }
-    Ok(result)
+    wait_task_job(&state.task_jobs, None).await
 }
 
 #[tauri::command]
 pub async fn task_run_one(state: State<'_, AppState>, uid: String) -> Result<TaskRunItem, String> {
-    let started_at_ms = reqlog::now_ms();
-    let cfg = state.shared_cfg.read().await.clone();
-    let account = cfg
-        .accounts
-        .iter()
-        .find(|a| a.uid == uid)
-        .ok_or_else(|| "账号不存在".to_string())?;
-    let client = gateway::upstream::new_client()?;
-    let result = tasks::run_account(&client, cfg.base_url.trim_end_matches('/'), account).await;
-    if matches!(result.checkin.as_str(), "ok" | "already") {
-        state.pool.set_checkin_done(&result.uid, started_at_ms);
-    }
-    Ok(result)
+    wait_task_job(&state.task_jobs, Some(uid))
+        .await?
+        .items
+        .into_iter()
+        .next()
+        .ok_or("任务未产生账号结果".into())
 }
 
 /// 单个账号签到，不执行成长任务或领取其他福利。
@@ -668,6 +710,9 @@ pub async fn checkin_one(state: State<'_, AppState>, uid: String) -> Result<Task
         nickname: account.nickname.clone(),
         checkin: result.as_ref().cloned().unwrap_or_else(|_| "failed".into()),
         accepted: 0,
+        completed: 0,
+        skipped: 0,
+        waiting: 0,
         claimed: 0,
         credit: 0,
         energy: 0,
@@ -710,7 +755,10 @@ mod renewal_tests {
             ..AppConfig::default()
         };
         current.accounts[0].login_ip = Some("203.0.113.8".into());
-        current.accounts[0].import_ip = Some(crate::import_ip::ImportIp { ip: "203.0.113.9".into(), observed_at: 1000 });
+        current.accounts[0].import_ip = Some(crate::import_ip::ImportIp {
+            ip: "203.0.113.9".into(),
+            observed_at: 1000,
+        });
         let mut submitted = AppConfig {
             accounts: vec![
                 account("existing", "old", "old-refresh", 500),

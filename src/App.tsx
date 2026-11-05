@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useApp } from "./stores/appStore";
+import { useTasks } from "./stores/taskStore";
 import { poolStatus } from "./lib/commands";
 import { useAutomation } from "./lib/useAutomation";
 import { reportError } from "./lib/errors";
@@ -24,6 +25,13 @@ export default function App() {
   const [poolError, setPoolError] = useState<string | null>(null);
   const [theme, setTheme] = useState(() => localStorage.getItem("theme") === "workbuddy-dark" ? "workbuddy-dark" : "workbuddy-light");
   useAutomation(!loading);
+  useEffect(() => {
+    if (loading) return;
+    const sync = () => void useTasks.getState().sync();
+    sync();
+    const timer = window.setInterval(sync, 1000);
+    return () => window.clearInterval(timer);
+  }, [loading]);
   const navigate = (next: Page) => { setPage(next); window.scrollTo({ top: 0, left: 0, behavior: "auto" }); };
 
   useEffect(() => { void load(); }, [load]);
@@ -135,7 +143,7 @@ export default function App() {
       <main className="wb-main" id="main-content">
         {loading ? <div className="wb-loading" role="status"><span className="loading loading-spinner loading-lg text-primary" /><p>正在打开你的工作空间…</p></div>
           : page === "overview" ? <OverviewPanel onNavigate={navigate} />
-          : page === "vault" ? <VaultPanel pool={pool} poolError={poolError} />
+          : page === "vault" ? <VaultPanel pool={pool} poolError={poolError} onOpenGrowth={() => navigate("growth")} />
           : page === "checkin" ? <CheckinPanel />
           : page === "growth" ? <GrowthPanel />
           : page === "gateway" ? <GatewayPanel /> : <SharePanel />}

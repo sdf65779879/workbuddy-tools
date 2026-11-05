@@ -3,11 +3,17 @@
 //!   POST billing host /v2/billing/meter/daily-checkin (global: /billing first)
 //!   GET  /v2/activity/growth/tasks
 //!   POST /v2/activity/growth/tasks/accept          {"task_codes":[...]}
-//!   POST /v2/activity/growth/tasks/reward/claim    {"task_code":"..."}
+//!   POST web host /activity/growth/tasks/{task_code}/claim (no body)
 //!   POST /billing/meter/claim-gift / claim-compensation
 
-use crate::{balances, config::AccountConfig};
+use crate::{
+    balances,
+    config::{AccountConfig, AppConfig},
+    growth_auto,
+};
+use futures_util::StreamExt;
 use serde::Serialize;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TaskView {
@@ -26,6 +32,8 @@ pub struct TaskView {
     pub status: String,
     pub claimed: bool,
     pub claimable: bool,
+    pub skipped: bool,
+    pub skip_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -34,6 +42,9 @@ pub struct TaskRunItem {
     pub nickname: String,
     pub checkin: String,
     pub accepted: i64,
+    pub completed: i64,
+    pub skipped: i64,
+    pub waiting: i64,
     pub claimed: i64,
     pub credit: i64,
     pub energy: i64,
@@ -47,21 +58,130 @@ pub struct TaskRunResult {
     pub total_energy: i64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskProgress {
+    pub task_code: Option<String>,
+    pub status: String,
+    pub message: String,
+}
+
+fn emit(
+    progress: &(dyn Fn(TaskProgress) + Send + Sync),
+    code: Option<&str>,
+    status: &str,
+    message: impl Into<String>,
+) {
+    progress(TaskProgress {
+        task_code: code.map(str::to_owned),
+        status: status.into(),
+        message: message.into(),
+    });
+}
+
+pub fn skip_reason(code: &str, title: &str) -> Option<String> {
+    let compact: String = title.chars().filter(|c| !c.is_whitespace()).collect();
+    let ignored = [
+        "无畏契约拼豆专家",
+        "中国电商运营专家",
+        "商家宣传页与海报设计师",
+        "直播电商教练",
+        "抖音策略师",
+    ];
+    (ignored.iter().any(|name| compact.contains(name))
+        || code == "wb_wechat_oa_subscribe_task"
+        || (compact.contains("关注")
+            && compact.contains("WorkBuddy")
+            && compact.contains("公众号")))
+    .then(|| "按设置自动忽略该任务".into())
+}
+
+pub(crate) async fn response_text(
+    response: reqwest::Response,
+) -> Result<(reqwest::StatusCode, String), String> {
+    let status = response.status();
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| "读取任务响应失败".to_string())?;
+        if bytes.len().saturating_add(chunk.len()) > 1024 * 1024 {
+            return Err("任务响应过大".into());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok((
+        status,
+        String::from_utf8(bytes).map_err(|_| "任务响应编码无效")?,
+    ))
+}
+
+fn growth_request(
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    url: &str,
+    account: &AccountConfig,
+) -> reqwest::RequestBuilder {
+    let mut req = client
+        .request(method, url)
+        .timeout(Duration::from_secs(25))
+        .bearer_auth(account.token.trim())
+        .header("User-Agent", "WorkBuddy/5.5.4")
+        .header("X-CodeBuddy-Request", "1")
+        .header("Accept", "application/json")
+        .header("Content-Type", "application/json");
+    if let Some(uid) = balances::upstream_user_id(account) {
+        req = req.header("X-User-Id", uid.as_ref());
+    }
+    if !account.enterprise_id.trim().is_empty() {
+        req = req
+            .header("X-Enterprise-Id", account.enterprise_id.trim())
+            .header("X-Tenant-Id", account.enterprise_id.trim());
+    }
+    if !account.domain.trim().is_empty() {
+        req = req.header("X-Domain", account.domain.trim());
+    }
+    req
+}
+
+pub(crate) fn growth_base(base: &str, realm: &str) -> Result<String, String> {
+    let url = crate::gateway::request::chat_url(base, realm)?;
+    Ok(url.trim_end_matches("/v2/chat/completions").into())
+}
+
+pub(crate) fn web_base(base: &str, realm: &str) -> Result<String, String> {
+    let parsed = reqwest::Url::parse(base).map_err(|_| "任务服务地址无效")?;
+    if matches!(
+        parsed.host_str(),
+        Some(
+            "copilot.tencent.com"
+                | "www.codebuddy.cn"
+                | "codebuddy.cn"
+                | "www.workbuddy.cn"
+                | "workbuddy.cn"
+                | "www.workbuddy.ai"
+                | "workbuddy.ai"
+        )
+    ) {
+        Ok(if realm == "global" {
+            "https://www.workbuddy.ai"
+        } else {
+            "https://www.workbuddy.cn"
+        }
+        .into())
+    } else {
+        Ok(base.trim_end_matches('/').into())
+    }
+}
+
+#[cfg(test)]
+fn token_account(token: &str) -> AccountConfig {
+    serde_json::from_value(serde_json::json!({"uid":"local-account","nickname":"","token":token,"realm":"cn","enabled":true,"paused":false})).expect("token account")
+}
+
 fn data_of(resp: &serde_json::Value) -> serde_json::Value {
     match resp.get("data") {
         Some(d) => d.clone(),
         None => resp.clone(),
     }
-}
-
-async fn post_json(
-    client: &reqwest::Client,
-    url: &str,
-    token: &str,
-    body: &serde_json::Value,
-) -> Result<serde_json::Value, String> {
-    let (status, text) = post_response(client, url, token, body).await?;
-    parse_api_response(status, &text)
 }
 
 async fn post_response(
@@ -72,30 +192,13 @@ async fn post_response(
 ) -> Result<(reqwest::StatusCode, String), String> {
     let resp = client
         .post(url)
+        .timeout(Duration::from_secs(25))
         .bearer_auth(token)
         .json(body)
         .send()
         .await
         .map_err(|e| e.to_string())?;
-    let status = resp.status();
-    let text = resp.text().await.map_err(|e| e.to_string())?;
-    Ok((status, text))
-}
-
-async fn get_json(
-    client: &reqwest::Client,
-    url: &str,
-    token: &str,
-) -> Result<serde_json::Value, String> {
-    let resp = client
-        .get(url)
-        .bearer_auth(token)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    let status = resp.status();
-    let text = resp.text().await.map_err(|e| e.to_string())?;
-    parse_api_response(status, &text)
+    response_text(resp).await
 }
 
 fn business_code(value: &serde_json::Value) -> Result<Option<i64>, String> {
@@ -109,7 +212,7 @@ fn business_code(value: &serde_json::Value) -> Result<Option<i64>, String> {
         .transpose()
 }
 
-fn parse_api_response(
+pub(crate) fn parse_api_response(
     status: reqwest::StatusCode,
     text: &str,
 ) -> Result<serde_json::Value, String> {
@@ -245,13 +348,21 @@ fn parse_checkin_response(status: reqwest::StatusCode, text: &str) -> Result<Str
 }
 
 /// 拉取成长任务列表。
-pub async fn list_tasks(
+pub async fn list_tasks_for_account(
     client: &reqwest::Client,
     base: &str,
-    token: &str,
+    account: &AccountConfig,
 ) -> Result<Vec<TaskView>, String> {
-    let url = format!("{}/v2/activity/growth/tasks", base.trim_end_matches('/'));
-    let resp = get_json(client, &url, token).await?;
+    let url = format!(
+        "{}/v2/activity/growth/tasks",
+        growth_base(base, &account.realm)?
+    );
+    let response = growth_request(client, reqwest::Method::GET, &url, account)
+        .send()
+        .await
+        .map_err(|_| "任务列表请求失败或超时")?;
+    let (status, text) = response_text(response).await?;
+    let resp = parse_api_response(status, &text)?;
     let data = data_of(&resp);
     let arr = data
         .get("tasks")
@@ -261,13 +372,16 @@ pub async fn list_tasks(
     let mut out = Vec::new();
     for t in arr {
         let (current, target) = match t.get("progress") {
-            Some(p) => (i64_of(&p["current"]), i64_of(&p["target"])),
-            None => (i64_of(&t["current"]), i64_of(&t["target"])),
+            Some(p) if p.is_object() && (i64_of(&p["current"]) > 0 || i64_of(&p["target"]) > 0) => {
+                (i64_of(&p["current"]), i64_of(&p["target"]))
+            }
+            _ => (i64_of(&t["current"]), i64_of(&t["target"])),
         };
         let accept_status = str_of(&t["accept_status"]);
         let claimed = accept_status == "claimed"
             || t.get("claimed").and_then(|v| v.as_bool()).unwrap_or(false);
         let target_reached = target > 0 && current >= target;
+        let skip_reason = skip_reason(&str_of(&t["task_code"]), &str_of(&t["title"]));
         out.push(TaskView {
             task_code: str_of(&t["task_code"]),
             title: str_of(&t["title"]),
@@ -286,17 +400,32 @@ pub async fn list_tasks(
             accept_status: accept_status.clone(),
             status: str_of(&t["status"]),
             claimed,
-            claimable: target_reached && !claimed,
+            claimable: target_reached
+                && !claimed
+                && skip_reason.is_none()
+                && !t["locked"].as_bool().unwrap_or(false),
+            skipped: skip_reason.is_some(),
+            skip_reason,
         });
     }
     Ok(out)
 }
 
 /// 接受任务（报名，幂等）。
+#[cfg(test)]
 pub async fn accept_tasks(
     client: &reqwest::Client,
     base: &str,
     token: &str,
+    codes: &[String],
+) -> Result<(), String> {
+    accept_tasks_for_account(client, base, &token_account(token), codes).await
+}
+
+async fn accept_tasks_for_account(
+    client: &reqwest::Client,
+    base: &str,
+    account: &AccountConfig,
     codes: &[String],
 ) -> Result<(), String> {
     if codes.is_empty() {
@@ -304,38 +433,72 @@ pub async fn accept_tasks(
     }
     let url = format!(
         "{}/v2/activity/growth/tasks/accept",
-        base.trim_end_matches('/')
+        growth_base(base, &account.realm)?
     );
-    post_json(
-        client,
-        &url,
-        token,
-        &serde_json::json!({ "task_codes": codes }),
-    )
-    .await
-    .map(|_| ())
+    let response = growth_request(client, reqwest::Method::POST, &url, account)
+        .json(&serde_json::json!({"task_codes":codes}))
+        .send()
+        .await
+        .map_err(|_| "接受任务请求失败或超时")?;
+    let (status, text) = response_text(response).await?;
+    let value = parse_api_response(status, &text)?;
+    if !value.is_object() {
+        return Err("接受任务响应无效".into());
+    }
+    Ok(())
 }
 
-/// 领取任务奖励。返回 (credit, energy)。
+#[cfg(test)]
 pub async fn claim_reward(
     client: &reqwest::Client,
     base: &str,
     token: &str,
     code: &str,
 ) -> Result<(i64, i64), String> {
-    let url = format!(
-        "{}/v2/activity/growth/tasks/reward/claim",
-        base.trim_end_matches('/')
-    );
-    let resp = post_json(
-        client,
-        &url,
-        token,
-        &serde_json::json!({ "task_code": code }),
-    )
-    .await?;
-    let data = data_of(&resp);
-    Ok((i64_of(&data["credit"]), i64_of(&data["energy"])))
+    claim_reward_for_account(client, base, &token_account(token), code)
+        .await
+        .map(|(credit, energy, _)| (credit, energy))
+}
+
+async fn claim_reward_for_account(
+    client: &reqwest::Client,
+    base: &str,
+    account: &AccountConfig,
+    code: &str,
+) -> Result<(i64, i64, bool), String> {
+    if code.trim().is_empty() {
+        return Err("任务码为空".into());
+    }
+    let base = web_base(base, &account.realm)?;
+    let mut url = reqwest::Url::parse(&format!("{base}/activity/growth/tasks/"))
+        .map_err(|_| "领奖地址无效")?;
+    url.path_segments_mut()
+        .map_err(|_| "领奖地址无效")?
+        .pop_if_empty()
+        .push(code)
+        .push("claim");
+    let origin = if account.realm == "global" {
+        "https://www.workbuddy.ai"
+    } else {
+        "https://www.workbuddy.cn"
+    };
+    let response = growth_request(client, reqwest::Method::POST, url.as_str(), account)
+        .header("x-client-platform", "web")
+        .header("Origin", origin)
+        .header("Referer", format!("{origin}/profile/growth-center"))
+        .send()
+        .await
+        .map_err(|_| "领奖请求失败或超时")?;
+    let (status, text) = response_text(response).await?;
+    let response = parse_api_response(status, &text)?;
+    let data = data_of(&response);
+    if data["already_claimed"].as_bool() == Some(true) {
+        return Ok((0, 0, true));
+    }
+    if !data["credit"].is_number() && !data["energy"].is_number() {
+        return Err("领奖响应缺少奖励结果".into());
+    }
+    Ok((i64_of(&data["credit"]), i64_of(&data["energy"]), false))
 }
 
 async fn try_claim_optional_benefit(
@@ -360,75 +523,518 @@ async fn try_claim_optional_benefit(
     Ok(())
 }
 
-/// 对单个账号执行「一键完成」：签到 → 拉任务 → 接受全部未接受 → 领取全部达标未领 → 领礼包/补偿。
+/// 真实对话动作仅在少数任务（夜猫子 black_cat 等）需要；其余可自动化任务的
+/// 行为动作（chat_5 纯事件补报、桌面指纹事件链、专家召唤等）统一由
+/// `crate::growth_auto` 实现（移植自 codebuddy_sub2api 实测口径）。
+
+const CHAT_TASK_PROMPT: &str = "你好，请用一句话介绍你能帮助完成哪些工作。";
+
+pub(crate) async fn real_conversation(
+    client: &reqwest::Client,
+    base: &str,
+    cfg: &AppConfig,
+    account: &AccountConfig,
+    model: &str,
+) -> Result<(), String> {
+    // 别名 → 上游模型 id：与本地网关 translate.rs 的出站翻译同一口径，
+    // 尊重用户自定义模型映射（config models）。
+    let model = cfg.resolve_model(model);
+    let url = crate::gateway::request::chat_url(base, &account.realm)?;
+    let body = serde_json::json!({"model":model,"messages":[{"role":"user","content":CHAT_TASK_PROMPT}],"stream":true,"max_tokens":512});
+    let response = crate::gateway::request::chat_post(client, &url, account, &body)
+        .timeout(Duration::from_secs(60))
+        .send()
+        .await
+        .map_err(|_| "真实对话请求失败或超时")?;
+    crate::gateway::probe::collect_chat_response(response)
+        .await
+        .map(|_| ())
+        .map_err(|error| {
+            // Sanitization of upstream text prevents credentials being copied into job logs.
+            let error = error.replace(account.token.trim(), "[凭证已隐藏]");
+            if account.refresh_token.is_empty() {
+                error
+            } else {
+                error.replace(&account.refresh_token, "[凭证已隐藏]")
+            }
+        })
+}
+
+/// 对话活跃上报（chat_request_send 事件）：POST {billing 域}/v2/report。
+/// 官方成长任务的对话计数以该上报为准——直接调用 chat completions 不会推进
+/// 进度；官方客户端每次对话后都会补发这条事件（codebuddy_sub2api 实测口径）。
+/// 全字段照抄官方客户端形状；userId 必填（=账号官方 uid），缺失会被服务端
+/// 200 但静默丢弃。
+pub(crate) async fn report_chat_activity(
+    client: &reqwest::Client,
+    configured_base: &str,
+    account: &AccountConfig,
+    conversation_id: &str,
+    model_id: &str,
+    model_name: &str,
+) -> Result<(), String> {
+    let uid = balances::upstream_user_id(account)
+        .ok_or_else(|| "账号缺少官方用户 ID，无法上报对话活跃".to_string())?
+        .into_owned();
+    let now = crate::reqlog::now_ms();
+    let event = serde_json::json!({
+        "eventCode": "chat_request_send",
+        "timestamp": now,
+        "reportDelay": 0,
+        "mode": "craft",
+        "conversationId": conversation_id,
+        "requestId": conversation_id,
+        "inputLength": CHAT_TASK_PROMPT.chars().count(),
+        "requestModelId": model_id,
+        "requestModelName": model_name,
+        "isPlan": false,
+        "isAutoExecuteTerminal": false,
+        "isAutoModify": false,
+        "codebaseEnable": false,
+        "maxToken": 0,
+        "maxSteps": 0,
+        "temperature": 0,
+        "maxRetries": 0,
+        "mentionContexts": [],
+        "knowledgeId": [],
+        "knowledgeName": [],
+        "codebaseId": "",
+        "mentionContextCount": 0,
+        "command": "",
+        "expertId": "",
+        "recommendId": "",
+        "skillId": "",
+        "skillCount": 0,
+        "totalCount": 0,
+        "fileUri": "",
+        "presentAt": now,
+        "traceId": "",
+        "rootRequestId": conversation_id,
+        "parentConversationId": conversation_id,
+        "agentName": "default",
+        "agentType": "conversation",
+        "userId": uid,
+    });
+    let base = balances::billing_base(configured_base, &account.realm)?;
+    let response = balances::billing_post(
+        client,
+        &format!("{base}/v2/report"),
+        account,
+        &serde_json::json!([event]),
+    )
+    .send()
+    .await
+    .map_err(|_| "对话活跃上报请求失败或超时".to_string())?;
+    let (status, text) = response_text(response).await?;
+    parse_api_response(status, &text)?;
+    Ok(())
+}
+
+#[cfg(test)]
 pub async fn run_account(
     client: &reqwest::Client,
     base: &str,
     account: &AccountConfig,
 ) -> TaskRunItem {
-    let token = account.token.trim();
+    run_account_with_progress(client, base, &AppConfig::default(), account, &|_| {}).await
+}
+
+pub async fn run_account_with_progress(
+    client: &reqwest::Client,
+    base: &str,
+    cfg: &AppConfig,
+    account: &AccountConfig,
+    progress: &(dyn Fn(TaskProgress) + Send + Sync),
+) -> TaskRunItem {
+    let clean = |text: String| {
+        let mut cleaned = text;
+        for secret in [account.token.trim(), account.refresh_token.trim()] {
+            if !secret.is_empty() {
+                cleaned = cleaned.replace(secret, "[凭证已隐藏]");
+            }
+        }
+        cleaned
+    };
+    let safe_progress = |mut event: TaskProgress| {
+        event.message = clean(event.message);
+        progress(event);
+    };
+    let mut item = run_account_inner(client, base, cfg, account, &safe_progress).await;
+    item.error = item.error.map(clean);
+    item
+}
+
+async fn run_account_inner(
+    client: &reqwest::Client,
+    base: &str,
+    cfg: &AppConfig,
+    account: &AccountConfig,
+    progress: &(dyn Fn(TaskProgress) + Send + Sync),
+) -> TaskRunItem {
     let mut item = TaskRunItem {
         uid: account.uid.clone(),
         nickname: account.nickname.clone(),
         checkin: String::new(),
         accepted: 0,
+        completed: 0,
+        skipped: 0,
+        waiting: 0,
         claimed: 0,
         credit: 0,
         energy: 0,
         error: None,
     };
     let mut errors = Vec::new();
-
+    emit(progress, None, "running", "正在签到");
     match checkin(client, base, account).await {
-        Ok(r) => item.checkin = r,
-        Err(e) => errors.push(format!("签到失败: {e}")),
+        Ok(result) => {
+            item.checkin = result;
+            emit(progress, None, "completed", "签到已确认");
+        }
+        Err(error) => {
+            emit(progress, None, "failed", format!("签到失败：{error}"));
+            errors.push(format!("签到失败: {error}"));
+        }
     }
-
-    match list_tasks(client, base, token).await {
+    emit(progress, None, "running", "正在读取成长任务");
+    match list_tasks_for_account(client, base, account).await {
         Ok(tasks) => {
-            let to_accept: Vec<String> = tasks
-                .iter()
-                .filter(|t| !t.locked && t.accept_status == "not_accepted")
-                .map(|t| t.task_code.clone())
-                .collect();
-            if let Err(e) = accept_tasks(client, base, token, &to_accept).await {
-                errors.push(format!("接受任务失败: {e}"));
-            } else {
-                item.accepted = to_accept.len() as i64;
-            }
-
-            for t in tasks.iter().filter(|t| t.claimable) {
-                match claim_reward(client, base, token, &t.task_code).await {
-                    Ok((c, e)) => {
-                        item.claimed += 1;
-                        item.credit += c;
-                        item.energy += e;
+            for mut task in tasks {
+                let code = task.task_code.clone();
+                let label = if task.title.is_empty() {
+                    code.clone()
+                } else {
+                    task.title.clone()
+                };
+                if task.skipped {
+                    item.skipped += 1;
+                    emit(
+                        progress,
+                        Some(&code),
+                        "skipped",
+                        format!("已忽略「{label}」"),
+                    );
+                    continue;
+                }
+                if task.claimed {
+                    emit(
+                        progress,
+                        Some(&code),
+                        "completed",
+                        format!("「{label}」已领取，无需重复执行"),
+                    );
+                    continue;
+                }
+                if task.locked {
+                    item.waiting += 1;
+                    emit(
+                        progress,
+                        Some(&code),
+                        "waiting",
+                        format!("「{label}」尚未解锁"),
+                    );
+                    continue;
+                }
+                if !matches!(task.accept_status.as_str(), "accepted" | "completed") {
+                    emit(
+                        progress,
+                        Some(&code),
+                        "running",
+                        format!("正在接受「{label}」"),
+                    );
+                    match accept_tasks_for_account(client, base, account, &[code.clone()]).await {
+                        Ok(()) => {
+                            item.accepted += 1;
+                        }
+                        Err(error) => {
+                            errors.push(format!("接受任务失败（{code}）: {error}"));
+                            emit(
+                                progress,
+                                Some(&code),
+                                "failed",
+                                format!("「{label}」接受失败：{error}"),
+                            );
+                            if !task.claimable {
+                                continue;
+                            }
+                        }
                     }
-                    Err(e) => errors.push(format!("领取任务奖励失败（{}）: {e}", t.task_code)),
+                    // Accept can unlock/complete tasks. Never claim based on a stale list.
+                    match list_tasks_for_account(client, base, account).await {
+                        Ok(updated) => {
+                            if let Some(current) = updated.into_iter().find(|t| t.task_code == code)
+                            {
+                                task = current;
+                            } else {
+                                item.waiting += 1;
+                                emit(
+                                    progress,
+                                    Some(&code),
+                                    "waiting",
+                                    format!("「{label}」接受后暂未出现在任务列表"),
+                                );
+                                continue;
+                            }
+                        }
+                        Err(error) => {
+                            errors.push(format!("任务回读失败（{code}）: {error}"));
+                            emit(progress, Some(&code), "failed", "接受后回读任务失败");
+                            continue;
+                        }
+                    }
+                }
+                if task.claimed {
+                    continue;
+                }
+                if task.skipped || task.locked {
+                    if task.skipped {
+                        item.skipped += 1;
+                    } else {
+                        item.waiting += 1;
+                    }
+                    emit(
+                        progress,
+                        Some(&code),
+                        "waiting",
+                        "任务状态已改变，本轮停止执行",
+                    );
+                    continue;
+                }
+                if !task.claimable {
+                    let hour = ((crate::reqlog::now_ms() / 3_600_000 + 8) % 24) as u8;
+                    let mut acted = false;
+                    if code == "black_cat" {
+                        // 夜猫子：仅北京时间 23:00–08:00 窗口内执行真实对话。
+                        if (8..23).contains(&hour) {
+                            item.waiting += 1;
+                            emit(
+                                progress,
+                                Some(&code),
+                                "waiting",
+                                "夜间任务仅在北京时间 23:00–08:00 执行",
+                            );
+                            continue;
+                        }
+                        emit(
+                            progress,
+                            Some(&code),
+                            "running",
+                            format!("正在为「{label}」执行真实对话"),
+                        );
+                        if let Err(error) =
+                            real_conversation(client, base, cfg, account, "glm-5.2").await
+                        {
+                            errors.push(format!("任务对话失败（{code}）: {error}"));
+                            emit(
+                                progress,
+                                Some(&code),
+                                "failed",
+                                format!("真实对话失败：{error}"),
+                            );
+                            continue;
+                        }
+                        acted = true;
+                    } else if growth_auto::auto_action_supported(&code) {
+                        emit(
+                            progress,
+                            Some(&code),
+                            "running",
+                            format!("正在执行「{label}」"),
+                        );
+                        match growth_auto::run_task_action(client, base, cfg, account, &task).await
+                        {
+                            Ok(message) => {
+                                emit(progress, Some(&code), "running", message);
+                                acted = true;
+                            }
+                            Err(error) => {
+                                errors.push(format!("任务执行失败（{code}）: {error}"));
+                                emit(
+                                    progress,
+                                    Some(&code),
+                                    "failed",
+                                    format!("执行失败：{error}"),
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                    if acted {
+                        // 给上游事件处理留时间，再回读进度确认是否推进/达标。
+                        tokio::time::sleep(Duration::from_millis(1200)).await;
+                        let previous = task.current;
+                        for read in 0..4 {
+                            if read > 0 {
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                            }
+                            match list_tasks_for_account(client, base, account).await {
+                                Ok(updated) => {
+                                    if let Some(updated) =
+                                        updated.into_iter().find(|t| t.task_code == code)
+                                    {
+                                        task = updated;
+                                        if task.current > previous
+                                            || task.claimable
+                                            || task.claimed
+                                            || task.locked
+                                            || task.skipped
+                                        {
+                                            break;
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    errors.push(format!("任务回读失败（{code}）: {error}"));
+                                    emit(progress, Some(&code), "failed", "执行后回读进度失败");
+                                    break;
+                                }
+                            }
+                        }
+                        if task.claimable
+                            || task.claimed
+                            || task.locked
+                            || task.skipped
+                            || task.current > previous
+                        {
+                            // 状态有推进，落入下方领奖/统计逻辑。
+                        } else {
+                            item.waiting += 1;
+                            emit(
+                                progress,
+                                Some(&code),
+                                "waiting",
+                                "已执行，官方尚未确认任务进度；请稍后刷新或在官方客户端完成条件后同步",
+                            );
+                            continue;
+                        }
+                    } else {
+                        emit(
+                            progress,
+                            Some(&code),
+                            "waiting",
+                            format!("「{label}」需要在官方客户端完成实际操作，本轮不自动执行"),
+                        );
+                    }
+                }
+                if task.claimed {
+                    item.completed += 1;
+                    continue;
+                }
+                if task.skipped {
+                    item.skipped += 1;
+                    emit(
+                        progress,
+                        Some(&code),
+                        "skipped",
+                        format!("「{label}」已按规则忽略"),
+                    );
+                    continue;
+                }
+                if !task.claimable || task.locked {
+                    item.waiting += 1;
+                    continue;
+                }
+                emit(
+                    progress,
+                    Some(&code),
+                    "running",
+                    format!("正在领取「{label}」奖励"),
+                );
+                match claim_reward_for_account(client, base, account, &code).await {
+                    Ok((credit, energy, already_claimed)) => {
+                        item.completed += 1;
+                        if already_claimed {
+                            emit(
+                                progress,
+                                Some(&code),
+                                "completed",
+                                format!("「{label}」已在其他请求中领取，本次没有新增奖励"),
+                            );
+                            continue;
+                        }
+                        item.claimed += 1;
+                        item.credit += credit;
+                        item.energy += energy;
+                        emit(
+                            progress,
+                            Some(&code),
+                            "completed",
+                            format!("「{label}」奖励已确认，+{credit} 积分 / +{energy} 能量"),
+                        );
+                    }
+                    Err(error) => {
+                        errors.push(format!("领取任务奖励失败（{code}）: {error}"));
+                        emit(
+                            progress,
+                            Some(&code),
+                            "failed",
+                            format!("「{label}」领奖失败：{error}"),
+                        );
+                    }
                 }
             }
         }
-        Err(e) => errors.push(format!("任务列表失败: {e}")),
+        Err(error) => {
+            errors.push(format!("任务列表失败: {error}"));
+            emit(
+                progress,
+                None,
+                "failed",
+                format!("读取任务列表失败：{error}"),
+            );
+        }
     }
-
-    let base = base.trim_end_matches('/');
-    for (path, label) in [
-        ("claim-gift", "领取礼包失败"),
-        ("claim-compensation", "领取补偿失败"),
-    ] {
-        if let Err(e) =
-            try_claim_optional_benefit(client, &format!("{base}/billing/meter/{path}"), token).await
-        {
-            errors.push(format!("{label}: {e}"));
+    let billing = balances::billing_base(base, &account.realm);
+    if let Ok(billing) = billing {
+        for (path, label) in [
+            ("claim-gift", "领取礼包失败"),
+            ("claim-compensation", "领取补偿失败"),
+        ] {
+            emit(
+                progress,
+                None,
+                "running",
+                format!(
+                    "正在检查{}",
+                    if path == "claim-gift" {
+                        "礼包"
+                    } else {
+                        "补偿"
+                    }
+                ),
+            );
+            if let Err(error) = try_claim_optional_benefit(
+                client,
+                &format!("{billing}/billing/meter/{path}"),
+                account.token.trim(),
+            )
+            .await
+            {
+                errors.push(format!("{label}: {error}"));
+                emit(progress, None, "failed", format!("{label}：{error}"));
+            }
         }
     }
     if !errors.is_empty() {
         item.error = Some(errors.join("；"));
     }
-
+    emit(
+        progress,
+        None,
+        if item.error.is_some() {
+            "failed"
+        } else {
+            "completed"
+        },
+        format!(
+            "账号作业已结束，领奖 {} 项，忽略 {} 项，待完成 {} 项",
+            item.claimed, item.skipped, item.waiting
+        ),
+    );
     item
 }
 
+#[cfg(test)]
 pub async fn run_all(
     client: &reqwest::Client,
     base: &str,
@@ -437,7 +1043,10 @@ pub async fn run_all(
     let mut items = Vec::new();
     let mut total_credit = 0i64;
     let mut total_energy = 0i64;
-    for a in accounts.iter().filter(|a| a.enabled && !a.paused) {
+    for a in accounts
+        .iter()
+        .filter(|a| a.enabled && !a.paused && a.realm == "cn" && !a.token.trim().is_empty())
+    {
         let item = run_account(client, base, a).await;
         total_credit += item.credit;
         total_energy += item.energy;
@@ -814,10 +1423,13 @@ mod tests {
                     StatusCode::UNAUTHORIZED,
                     r#"{"code":10001,"msg":"token expired"}"#,
                 ),
-                "/v2/activity/growth/tasks/reward/claim" => {
+                path if path.starts_with("/activity/growth/tasks/") && path.ends_with("/claim") => {
+                    assert_eq!(request.headers()["x-client-platform"], "web");
+                    assert_eq!(request.headers()["x-user-id"], "official-test-uid");
                     let body = to_bytes(request.into_body(), 8192).await.unwrap();
-                    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                    match body["task_code"].as_str().unwrap() {
+                    assert!(body.is_empty());
+                    let code = path.trim_start_matches("/activity/growth/tasks/").trim_end_matches("/claim");
+                    match code {
                         "service-failure" => (
                             StatusCode::SERVICE_UNAVAILABLE,
                             r#"{"message":"reward service unavailable"}"#,
@@ -898,5 +1510,155 @@ mod tests {
         {
             assert!(error.contains(operation), "{error}");
         }
+    }
+    #[test]
+    fn ignored_tasks_match_six_requests_without_excluding_unrelated_experts() {
+        for title in [
+            "体验「无畏契约拼豆专家」",
+            "体验「中国电商运营专家」",
+            "体验「商家宣传页与海报设计师」",
+            "体验「直播电商教练」",
+            "关注「腾讯 WorkBuddy」官方公众号",
+            "体验「抖音策略师」",
+        ] {
+            assert!(skip_reason("future-code", title).is_some(), "{title}");
+        }
+        assert!(skip_reason("wb_wechat_oa_subscribe_task", "").is_some());
+        assert!(skip_reason("expert_5", "使用五个专家").is_none());
+        assert!(skip_reason("manual", "关注项目进展").is_none());
+    }
+
+    #[tokio::test]
+    async fn job_reports_chat5_events_and_claims_only_on_confirmed_progress() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for scenario in ["advance", "stall", "already"] {
+            let reads = Arc::new(AtomicUsize::new(0));
+            let reports = Arc::new(AtomicUsize::new(0));
+            let claims = Arc::new(AtomicUsize::new(0));
+            let app_reads = reads.clone();
+            let app_reports = reports.clone();
+            let app_claims = claims.clone();
+            let app = Router::new().fallback(any(move |request: Request| {
+                let reads = app_reads.clone();
+                let reports = app_reports.clone();
+                let claims = app_claims.clone();
+                async move {
+                    let path = request.uri().path().to_string();
+                    let value = match path.as_str() {
+                        "/v2/activity/growth/tasks" => {
+                            assert_eq!(request.headers()["x-user-id"], "official-test-uid");
+                            assert_eq!(request.headers()["x-enterprise-id"], "test-enterprise");
+                            let read_index = reads.fetch_add(1, Ordering::SeqCst);
+                            // chat_5 进度：already 始终达标；advance 在执行动作后的
+                            // 回读达标；stall 始终不推进（验证不重复上报 + 不误领奖）。
+                            let chat_current = match scenario {
+                                "already" => 1,
+                                "advance" if read_index >= 1 => 1,
+                                _ => 0,
+                            };
+                            let mut tasks = vec![serde_json::json!({"task_code":"chat_5","title":"真实对话","progress":null,"current":chat_current,"target":1,"accept_status":"accepted"}),
+                                serde_json::json!({"task_code":"manual-operation","title":"真实客户端操作","target":1,"current":0,"accept_status":"accepted"})];
+                            for (index, title) in ["无畏契约拼豆专家","中国电商运营专家","商家宣传页与海报设计师","直播电商教练","关注 腾讯 WorkBuddy 官方公众号","抖音策略师"].iter().enumerate() {
+                                tasks.push(serde_json::json!({"task_code":format!("ignored-{index}"),"title":title,"target":1,"current":1,"accept_status":"not_accepted"}));
+                            }
+                            serde_json::json!({"code":0,"data":{"tasks":tasks}})
+                        }
+                        "/activity/growth/tasks/chat_5/claim" => {
+                            assert!(matches!(scenario, "advance" | "already"));
+                            assert_eq!(request.headers()["x-client-platform"], "web");
+                            assert_eq!(request.headers()["x-user-id"], "official-test-uid");
+                            assert!(to_bytes(request.into_body(),8192).await.unwrap().is_empty());
+                            claims.fetch_add(1, Ordering::SeqCst);
+                            serde_json::json!({"code":0,"data":{"credit":100,"energy":5}})
+                        }
+                        "/v2/report" => {
+                            // chat_5 判据：chat_request_send 事件（billing 域），模型对齐官方口径。
+                            assert_eq!(request.headers()["x-user-id"], "official-test-uid");
+                            let body: serde_json::Value = serde_json::from_slice(&to_bytes(request.into_body(),8192).await.unwrap()).unwrap();
+                            let event = &body[0];
+                            assert_eq!(event["eventCode"], "chat_request_send");
+                            assert_eq!(event["userId"], "official-test-uid");
+                            assert_eq!(event["requestModelId"], "deepseek-v4-flash");
+                            assert!(event["conversationId"].as_str().is_some_and(|id| id.starts_with("wb-task-chat5-")));
+                            reports.fetch_add(1, Ordering::SeqCst);
+                            serde_json::json!({"code":0,"data":{}})
+                        }
+                        "/v2/billing/meter/daily-checkin" | "/billing/meter/claim-gift" | "/billing/meter/claim-compensation" => serde_json::json!({"code":0,"data":{}}),
+                        _ => panic!("Unexpected request including skipped task or fabricated telemetry: {path}"),
+                    };
+                    (StatusCode::OK, axum::Json(value))
+                }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let captured = events.clone();
+            let result = run_account_with_progress(
+                &reqwest::Client::new(),
+                &base,
+                &AppConfig::default(),
+                &account(),
+                &move |event| {
+                    captured.lock().unwrap().push(event);
+                },
+            )
+            .await;
+            server.abort();
+            assert_eq!(result.skipped, 6);
+            assert_eq!(
+                reports.load(Ordering::SeqCst),
+                if scenario == "already" { 0 } else { 1 },
+                "chat_5 只按差额补报一次事件，进度停滞时不重复上报"
+            );
+            assert_eq!(
+                claims.load(Ordering::SeqCst),
+                if matches!(scenario, "advance" | "already") {
+                    1
+                } else {
+                    0
+                }
+            );
+            assert_eq!(
+                result.claimed,
+                if matches!(scenario, "advance" | "already") {
+                    1
+                } else {
+                    0
+                }
+            );
+            assert_eq!(result.waiting, if scenario == "stall" { 2 } else { 1 });
+            let logs = events.lock().unwrap();
+            assert_eq!(
+                logs.iter()
+                    .filter(|event| event.status == "skipped")
+                    .count(),
+                6
+            );
+            assert!(logs.last().unwrap().message.contains("作业已结束"));
+        }
+    }
+
+    #[tokio::test]
+    async fn job_logs_redact_upstream_echoed_credentials() {
+        let (base, server) = mock_api(
+            StatusCode::BAD_REQUEST,
+            r#"{"code":10001,"msg":"test-token"}"#,
+        )
+        .await;
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let captured = logs.clone();
+        let result =
+            run_account_with_progress(&reqwest::Client::new(), &base, &AppConfig::default(), &account(), &move |event| {
+                captured.lock().unwrap().push(event)
+            })
+            .await;
+        server.abort();
+        assert!(!result.error.unwrap().contains("test-token"));
+        assert!(logs
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|event| !event.message.contains("test-token")));
     }
 }

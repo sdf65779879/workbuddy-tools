@@ -5,10 +5,12 @@ mod browser_auth;
 mod commands;
 mod config;
 mod gateway;
+mod growth_auto;
 mod import_ip;
 mod pool;
 mod renewal;
 mod reqlog;
+mod task_jobs;
 mod tasks;
 mod usage;
 mod workbuddy_auth_crypto;
@@ -49,6 +51,8 @@ pub fn run() {
     renewal.start();
     let browser_auth = browser_auth::Service::new(shared_cfg.clone(), account_refreshes.clone());
 
+    let task_jobs = task_jobs::Service::new(shared_cfg.clone(), pool.clone());
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
@@ -58,6 +62,7 @@ pub fn run() {
             account_refreshes,
             renewal,
             browser_auth,
+            task_jobs,
             gateway: Mutex::new(None),
             keys,
             pool,
@@ -84,6 +89,8 @@ pub fn run() {
             commands::reqlog_snapshot,
             commands::reqlog_read,
             commands::task_scan_all,
+            commands::start_task_job,
+            commands::task_job_status,
             commands::task_run_all,
             commands::task_run_one,
             commands::checkin_one,

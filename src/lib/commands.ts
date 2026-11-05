@@ -16,6 +16,7 @@ import type {
   ReqlogSnapshot,
   RefreshResult,
   TaskRunItem,
+  TaskJobSnapshot,
   TaskRunResult,
   TaskScanItem,
   TestResult,
@@ -77,6 +78,8 @@ export const reqlogRead = (limit: number, filter: LogFilter) =>
   invoke<LogEvent[]>("reqlog_read", { limit, filter });
 
 export const taskScanAll = () => invoke<TaskScanItem[]>("task_scan_all");
+export const startTaskJob = (uid?: string) => invoke<TaskJobSnapshot>("start_task_job", { uid: uid ?? null });
+export const taskJobStatus = () => invoke<TaskJobSnapshot | null>("task_job_status");
 export const taskRunAll = async () => {
   const date = checkinDate();
   const result = await invoke<TaskRunResult>("task_run_all");
