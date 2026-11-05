@@ -1,0 +1,43 @@
+[package]
+name = "workbuddy-codex-gateway"
+version = "0.1.0"
+description = "WorkBuddy -> Codex local reverse-proxy gateway"
+authors = ["workbuddy-myself"]
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "workbuddy_codex_gateway_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-opener = "2"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+aes-gcm = "0.10"
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["json", "macros"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+futures-util = "0.3"
+tokio-stream = { version = "0.1", features = ["sync"] }
+toml_edit = "0.22"
+dirs = "6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"

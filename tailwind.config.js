@@ -1,0 +1,75 @@
+/** @type {import('tailwindcss').Config} */
+export default {
+  content: ["./index.html", "./src/**/*.{js,ts,jsx,tsx}"],
+  theme: {
+    extend: {
+      fontFamily: {
+        sans: [
+          "Inter",
+          "-apple-system",
+          "Segoe UI",
+          "PingFang SC",
+          "Microsoft YaHei UI",
+          "Microsoft YaHei",
+          "sans-serif",
+        ],
+      },
+    },
+  },
+  plugins: [require("daisyui")],
+  daisyui: {
+    themes: [
+      {
+        "workbuddy-light": {
+          primary: "#08b96a",
+          "primary-content": "#ffffff",
+          secondary: "#6ba9c0",
+          "secondary-content": "#ffffff",
+          accent: "#0abf72",
+          "accent-content": "#ffffff",
+          neutral: "#00232c",
+          "neutral-content": "#ffffff",
+          "base-100": "#ffffff",
+          "base-200": "#f0f7f3",
+          "base-300": "#e2ede6",
+          "base-content": "#20382f",
+          info: "#44a3bd",
+          "info-content": "#ffffff",
+          success: "#12995e",
+          "success-content": "#ffffff",
+          warning: "#d4aa40",
+          "warning-content": "#3a2f00",
+          error: "#ff5a52",
+          "error-content": "#ffffff",
+        },
+      },
+      {
+        "workbuddy-dark": {
+          primary: "#32cf8d",
+          "primary-content": "#012b36",
+          secondary: "#6ba9c0",
+          "secondary-content": "#ffffff",
+          accent: "#0abf72",
+          "accent-content": "#ffffff",
+          neutral: "#04303f",
+          "neutral-content": "#e5faff",
+          "base-100": "#1c3029",
+          "base-200": "#13251d",
+          "base-300": "#2d4939",
+          "base-content": "#dbece2",
+          info: "#44a3bd",
+          "info-content": "#012b36",
+          success: "#12995e",
+          "success-content": "#ffffff",
+          warning: "#d4aa40",
+          "warning-content": "#3a2f00",
+          error: "#ff5a52",
+          "error-content": "#ffffff",
+        },
+      },
+    ],
+    darkTheme: "workbuddy-dark",
+    logs: false,
+  },
+};
+
